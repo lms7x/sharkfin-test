@@ -18,6 +18,8 @@ WARNING_MINUTES  = 10
 PROMETHEUS_URL   = 'https://api.prombot.co.uk/api/travel'
 YATA_URL         = 'https://yata.yt/api/v1/travel/export/'
 
+TRAVEL_URL = "https://www.torn.com/page.php?sid=travel"
+
 # ============================================================
 # STATE - Self-calibrating with cycle tracking
 # ============================================================
@@ -26,7 +28,7 @@ state = {
     'quantity': None,
     'last_depletion': None,
     'last_restock': None,
-    'cycle_history': [],  # [{depletion, restock, duration}]
+    'cycle_history': [],
     'avg_cycle_duration': None,
     'predicted_restock': None,
     'prometheus_restock': None,
@@ -64,48 +66,55 @@ def parse_iso(dt_str):
         return None
 
 def calc_depart_time(restock_ms):
-    """Land 2 min AFTER restock, so depart = restock - 94min flight + 2min = restock - 92min"""
     return restock_ms - (FLIGHT_MINUTES * 60 * 1000) + (LANDING_BUFFER * 60 * 1000)
 
 def record_cycle(depletion_time, restock_time):
-    """Track complete cycle for self-calibration"""
     duration = restock_time - depletion_time
     state['cycle_history'].append({
         'depletion': depletion_time,
         'restock': restock_time,
         'duration': duration
     })
-    
-    # Keep last 10 cycles
+
     if len(state['cycle_history']) > 10:
         state['cycle_history'].pop(0)
-    
-    # Calculate average cycle duration
+
     durations = [c['duration'] for c in state['cycle_history']]
     state['avg_cycle_duration'] = sum(durations) / len(durations)
-    
+
     log(f"📊 Cycle recorded | duration: {fmt(duration)} | avg: {fmt(state['avg_cycle_duration'])} | cycles: {len(state['cycle_history'])}")
 
 def predict_next_restock(depletion_time):
-    """Self-calibrated prediction based on learned cycles"""
     if state['avg_cycle_duration']:
         return depletion_time + state['avg_cycle_duration']
-    # Default: 2 hours
     return depletion_time + (2 * 60 * 60 * 1000)
 
 def validate_and_adjust(predicted, actual):
-    """Compare prediction vs Prometheus actual, adjust if needed"""
     error = actual - predicted
     error_min = error / (60 * 1000)
-    
+
     log(f"🎓 Validation: predicted={ts(predicted)} | actual={ts(actual)} | error={fmt(error)}")
-    
-    # If error > 5 min, adjust the average
+
     if abs(error_min) > 5 and state['avg_cycle_duration']:
-        adjustment = error * 0.3  # 30% correction
+        adjustment = error * 0.3
         old_avg = state['avg_cycle_duration']
         state['avg_cycle_duration'] += adjustment
         log(f"⚙️ Adjusted avg cycle: {fmt(old_avg)} → {fmt(state['avg_cycle_duration'])}")
+
+# ============================================================
+# DISCORD UI - TRAVEL BUTTON
+# ============================================================
+
+class TravelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                label="🌴 Open Travel Agency",
+                style=discord.ButtonStyle.link,
+                url=TRAVEL_URL
+            )
+        )
 
 # ============================================================
 # DATA
@@ -167,9 +176,34 @@ def embed_online():
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc)
     )
-    e.add_field(name="✈️ Flight",   value="1h 34m",      inline=True)
-    e.add_field(name="🎯 Landing",  value="2min AFTER restock", inline=True)
-    e.add_field(name="🔄 Check",    value="Every 1min",  inline=True)
+    e.add_field(name="✈️ Flight", value="1h 34m", inline=True)
+    e.add_field(name="🎯 Landing", value="2min AFTER restock", inline=True)
+    e.add_field(name="🔄 Check", value="Every 1min", inline=True)
+    return e
+
+def embed_warning(dept, restock):
+    e = discord.Embed(
+        title="⏰ DEPART IN 10 MINUTES",
+        description="Get ready to fly to Hawaii!",
+        color=0xFFAA00,
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name="✈️ Depart At", value=ts(dept), inline=False)
+    e.add_field(name="🎯 Restock At", value=ts(restock), inline=False)
+    e.add_field(name="🛬 Landing", value=f"{LANDING_BUFFER} min AFTER restock", inline=False)
+    return e
+
+def embed_depart(dept, restock):
+    landing = dept + (FLIGHT_MINUTES * 60 * 1000)
+    e = discord.Embed(
+        title="✈️ FLY NOW TO HAWAII!",
+        description="**Buy your ticket immediately!**",
+        color=0x0099FF,
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name="🛬 Landing At", value=ts(landing), inline=False)
+    e.add_field(name="🎯 Restock At", value=ts(restock), inline=False)
+    e.add_field(name="⏱️ Timing", value=f"Land {LANDING_BUFFER}min after restock ✅", inline=False)
     return e
 
 def embed_depletion(cost):
@@ -190,31 +224,6 @@ def embed_depletion(cost):
         e.add_field(name="✈️ Depart At", value=ts(dept), inline=False)
     else:
         e.add_field(name="⏳ Status", value="Watching this cycle to learn timing", inline=False)
-    return e
-
-def embed_warning(dept, restock):
-    e = discord.Embed(
-        title="⏰ DEPART IN 10 MINUTES",
-        description="Get ready to fly to Hawaii!",
-        color=0xFFAA00,
-        timestamp=datetime.now(timezone.utc)
-    )
-    e.add_field(name="✈️ Depart At",  value=ts(dept),    inline=False)
-    e.add_field(name="🎯 Restock At", value=ts(restock), inline=False)
-    e.add_field(name="🛬 Landing", value=f"{LANDING_BUFFER} min AFTER restock", inline=False)
-    return e
-
-def embed_depart(dept, restock):
-    landing = dept + (FLIGHT_MINUTES * 60 * 1000)
-    e = discord.Embed(
-        title="✈️ FLY NOW TO HAWAII!",
-        description="**Buy your ticket immediately!**",
-        color=0x0099FF,
-        timestamp=datetime.now(timezone.utc)
-    )
-    e.add_field(name="🛬 Landing At", value=ts(landing),  inline=False)
-    e.add_field(name="🎯 Restock At", value=ts(restock),  inline=False)
-    e.add_field(name="⏱️ Timing", value=f"Land {LANDING_BUFFER}min after restock ✅", inline=False)
     return e
 
 def embed_restock(qty, cost):
@@ -239,9 +248,9 @@ def embed_restock(qty, cost):
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 
-async def dm(embed):
+async def dm(embed, view=None):
     user = await bot.fetch_user(YOUR_DISCORD_ID)
-    await user.send(embed=embed)
+    await user.send(embed=embed, view=view)
 
 @bot.event
 async def on_ready():
@@ -261,49 +270,35 @@ async def monitor():
     prev_qty = state['quantity']
     state['quantity'] = qty
 
-    # ── Update Prometheus restock time ──────────────────────────
     if data['next_restock']:
         if data['next_restock'] != state['prometheus_restock']:
             state['prometheus_restock'] = data['next_restock']
             log(f"🔍 Prometheus nextRestock: {ts(data['next_restock'])}")
-            
-            # Validate our prediction if we had one
+
             if state['predicted_restock']:
                 validate_and_adjust(state['predicted_restock'], data['next_restock'])
-            
-            # Use Prometheus time as ground truth
+
             state['predicted_restock'] = data['next_restock']
             state['warning_sent'] = False
             state['depart_sent'] = False
 
-    # ── Depletion detected ──────────────────────────────────────
     if prev_qty is not None and prev_qty > 0 and qty == 0:
         state['last_depletion'] = n
-        
-        # Make prediction based on learned cycles
         state['predicted_restock'] = predict_next_restock(n)
         state['warning_sent'] = False
         state['depart_sent'] = False
-        
         await dm(embed_depletion(data['cost']))
         log(f"🔴 Depletion | predicted next: {ts(state['predicted_restock'])}")
 
-    # ── Restock detected ────────────────────────────────────────
     elif prev_qty == 0 and qty > 0:
         state['last_restock'] = n
-        
-        # Record complete cycle
         if state['last_depletion']:
             record_cycle(state['last_depletion'], n)
-        
         await dm(embed_restock(qty, data['cost']))
         log(f"🟢 Restock")
-        
-        # Reset
         state['predicted_restock'] = None
         state['prometheus_restock'] = None
 
-    # ── Travel notifications ─────────────────────────────────────
     if state['predicted_restock'] and qty == 0:
         dept = calc_depart_time(state['predicted_restock'])
         warn = dept - (WARNING_MINUTES * 60 * 1000)
@@ -314,11 +309,13 @@ async def monitor():
             log("⏰ Warning sent")
 
         if not state['depart_sent'] and dept <= n < state['predicted_restock']:
-            await dm(embed_depart(dept, state['predicted_restock']))
+            await dm(
+                embed_depart(dept, state['predicted_restock']),
+                view=TravelView()
+            )
             state['depart_sent'] = True
             log("✈️ Depart sent")
 
-    # ── Status log ──────────────────────────────────────────────
     if state['predicted_restock'] and qty == 0:
         dept = calc_depart_time(state['predicted_restock'])
         log(f"SOLD OUT | restock in {fmt(state['predicted_restock']-n)} | depart in {fmt(dept-n)} | cycles={len(state['cycle_history'])}")
