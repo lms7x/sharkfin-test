@@ -40,7 +40,8 @@ def fmt(ms):
     s = abs(int(ms)) // 1000
     h = s // 3600
     m = (s % 3600) // 60
-    return f"{h}h {m}m" if h > 0 else f"{m}m"
+    prefix = "-" if ms < 0 else ""
+    return f"{prefix}{h}h {m}m" if h > 0 else f"{prefix}{m}m"
 
 def ts(ms):
     epoch = int(ms / 1000)
@@ -57,10 +58,8 @@ def parse_iso(dt_str):
     except:
         return None
 
-def depart_time():
-    if not state['next_restock']:
-        return None
-    return state['next_restock'] - (FLIGHT_MINUTES * 60 * 1000) - (BUFFER_MINUTES * 60 * 1000)
+def get_depart_time(restock_ms):
+    return restock_ms - (FLIGHT_MINUTES * 60 * 1000) - (BUFFER_MINUTES * 60 * 1000)
 
 # ============================================================
 # DATA
@@ -122,48 +121,52 @@ def embed_online():
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc)
     )
-    e.add_field(name="✈️ Flight Time", value="1h 34m",              inline=True)
+    e.add_field(name="✈️ Flight Time", value="1h 34m",               inline=True)
     e.add_field(name="⏱️ Buffer",      value=f"{BUFFER_MINUTES} min", inline=True)
-    e.add_field(name="🔄 Check Rate",  value="Every 1 minute",      inline=True)
+    e.add_field(name="🔄 Check Rate",  value="Every 1 minute",       inline=True)
     return e
 
-def embed_depletion(data, dept):
+def embed_depletion(data, dept, restock):
     e = discord.Embed(
         title="🔴 SHARK FINS DEPLETED",
-        description="Stock sold out! Departure timer started.",
+        description="Stock sold out!",
         color=0xFF4444,
         timestamp=datetime.now(timezone.utc)
     )
     e.add_field(name="📦 Source",     value=data['source'],       inline=True)
     e.add_field(name="💰 Last Price", value=f"${data['cost']:,}", inline=True)
-    if state['next_restock'] and dept:
-        e.add_field(name="🎯 Restock At", value=ts(state['next_restock']), inline=False)
-        e.add_field(name="✈️ Depart At",  value=ts(dept),                  inline=False)
-    else:
-        e.add_field(name="⏳ Restock Time", value="Waiting for Prometheus data...", inline=False)
+    if restock and dept:
+        e.add_field(name="🎯 Restock At", value=ts(restock), inline=False)
+        e.add_field(name="✈️ Depart At",  value=ts(dept),    inline=False)
     return e
 
-def embed_warning(dept):
+def embed_warning(dept, restock):
     e = discord.Embed(
         title="⏰ DEPART IN 10 MINUTES",
         description="Start getting ready to fly to Hawaii!",
         color=0xFFAA00,
         timestamp=datetime.now(timezone.utc)
     )
-    e.add_field(name="✈️ Depart At",  value=ts(dept),                  inline=False)
-    e.add_field(name="🎯 Restock At", value=ts(state['next_restock']), inline=False)
+    e.add_field(name="✈️ Depart At",  value=ts(dept),    inline=False)
+    e.add_field(name="🎯 Restock At", value=ts(restock), inline=False)
     return e
 
-def embed_depart(dept):
+def embed_depart(dept, restock, late_by_ms=0):
     landing = dept + (FLIGHT_MINUTES * 60 * 1000) + (BUFFER_MINUTES * 60 * 1000)
+    if late_by_ms > 60000:
+        title = f"✈️ FLY NOW - {fmt(late_by_ms)} LATE BUT GO!"
+        desc  = f"**Ideal departure was {fmt(late_by_ms)} ago - still worth flying!**"
+    else:
+        title = "✈️ FLY NOW TO HAWAII!"
+        desc  = "**Buy your ticket immediately!**"
     e = discord.Embed(
-        title="✈️ FLY NOW TO HAWAII!",
-        description="**Buy your ticket immediately!**",
+        title=title,
+        description=desc,
         color=0x0099FF,
         timestamp=datetime.now(timezone.utc)
     )
-    e.add_field(name="🛬 Landing At", value=ts(landing),               inline=False)
-    e.add_field(name="🎯 Restock At", value=ts(state['next_restock']), inline=False)
+    e.add_field(name="🛬 Landing At", value=ts(landing),  inline=False)
+    e.add_field(name="🎯 Restock At", value=ts(restock),  inline=False)
     e.add_field(name="⚡ Remember",   value="15-second protection window on arrival!", inline=False)
     return e
 
@@ -177,6 +180,47 @@ def embed_restock(data):
     e.add_field(name="💰 Price",  value=f"${data['cost']:,}", inline=True)
     e.add_field(name="📦 Source", value=data['source'],       inline=True)
     return e
+
+# ============================================================
+# CORE LOGIC: fire travel notifications immediately on new restock time
+# ============================================================
+
+async def handle_new_restock_time(restock, cost, source):
+    """
+    Called the moment we see a new nextRestock timestamp.
+    Immediately figures out where we are in the timeline and
+    fires the right notification without waiting for a future check.
+    """
+    n    = now_ms()
+    dept = get_depart_time(restock)
+    warn = dept - (WARNING_MINUTES * 60 * 1000)
+
+    log(f"New restock time: {restock} | depart: {dept} | now: {n} | diff: {fmt(dept - n)}")
+
+    # Too late - restock already happened or is imminent, skip travel alerts
+    if n >= restock:
+        log("Restock time already passed, skipping travel notifications")
+        return
+
+    # Past depart time but restock not yet - send depart immediately (you're late but still go!)
+    if n >= dept:
+        late_by = n - dept
+        log(f"Past ideal depart time by {fmt(late_by)} - sending late departure alert")
+        await dm(embed_depart(dept, restock, late_by_ms=late_by))
+        state['depart_sent']  = True
+        state['warning_sent'] = True  # Skip warning, already past it
+        return
+
+    # Past warning time but before depart - send warning immediately
+    if n >= warn:
+        log("Inside warning window - sending warning immediately")
+        await dm(embed_warning(dept, restock))
+        state['warning_sent'] = True
+        # Depart will fire on next check via normal loop
+        return
+
+    # We're early - warning and depart will fire via normal loop
+    log(f"On schedule - warning in {fmt(warn - n)}, depart in {fmt(dept - n)}")
 
 # ============================================================
 # BOT
@@ -207,54 +251,46 @@ async def monitor():
     prev_qty = state['quantity']
     state['quantity'] = qty
 
-    # Always update next_restock from Prometheus when stock is 0
-    if data['next_restock']:
+    # ── New restock time from Prometheus ────────────────────────
+    # This is the KEY trigger - fires immediately on any new restock time
+    if data['next_restock'] and data['next_restock'] != state['next_restock']:
         state['next_restock'] = data['next_restock']
-
-    dept = depart_time()
-
-    # ── On first run after restart, initialize state correctly ──
-    # If bot restarted while stock was already 0, treat as if we
-    # just detected depletion so countdown notifications work
-    if prev_qty is None and qty == 0 and state['next_restock']:
-        log("Bot restarted while stock depleted - restoring countdown state")
         state['warning_sent'] = False
         state['depart_sent']  = False
         state['restock_sent'] = False
+        await handle_new_restock_time(data['next_restock'], data['cost'], data['source'])
 
     # ── Depletion detected ──────────────────────────────────────
     if prev_qty is not None and prev_qty > 0 and qty == 0:
-        state['warning_sent'] = False
-        state['depart_sent']  = False
-        state['restock_sent'] = False
-        await dm(embed_depletion(data, dept))
-        log(f"Depletion alert sent | Restock: {state['next_restock']} | Depart: {dept}")
+        dept = get_depart_time(state['next_restock']) if state['next_restock'] else None
+        await dm(embed_depletion(data, dept, state['next_restock']))
+        log(f"Depletion alert sent")
 
     # ── Restock detected ────────────────────────────────────────
-    elif prev_qty == 0 and qty > 0:
+    elif prev_qty == 0 and qty > 0 and not state['restock_sent']:
         state['restock_sent'] = True
         await dm(embed_restock(data))
         log("Restock alert sent")
 
-    # ── Countdown (fires whenever stock is 0 and time is right) ─
-    # Uses wide window (30 min) so it's never missed between checks
-    if dept and qty == 0:
+    # ── Normal countdown loop (for when we're early enough) ─────
+    if state['next_restock'] and qty == 0:
+        dept      = get_depart_time(state['next_restock'])
         warn_time = dept - (WARNING_MINUTES * 60 * 1000)
 
         if not state['warning_sent'] and warn_time <= n < dept:
-            await dm(embed_warning(dept))
+            await dm(embed_warning(dept, state['next_restock']))
             state['warning_sent'] = True
             log("Warning notification sent")
 
-        # Wide 30-min window so a bot restart never misses this
-        if not state['depart_sent'] and dept <= n < dept + (30 * 60 * 1000):
-            await dm(embed_depart(dept))
+        if not state['depart_sent'] and dept <= n < state['next_restock']:
+            await dm(embed_depart(dept, state['next_restock']))
             state['depart_sent'] = True
             log("Departure notification sent")
 
     # ── Status log ──────────────────────────────────────────────
-    if dept and qty == 0:
-        log(f"[{data['source']}] SOLD OUT | Restock in {fmt(state['next_restock'] - n)} | Depart in {fmt(dept - n)}")
+    if state['next_restock'] and qty == 0:
+        dept = get_depart_time(state['next_restock'])
+        log(f"[{data['source']}] SOLD OUT | restock in {fmt(state['next_restock']-n)} | depart in {fmt(dept-n)} | W={state['warning_sent']} D={state['depart_sent']}")
     else:
         log(f"[{data['source']}] qty={qty} | ${data['cost']:,}")
 
